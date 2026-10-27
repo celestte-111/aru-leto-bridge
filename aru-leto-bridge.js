@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-// aru-leto-bridge.js — Leto → Aru 唤醒桥 v2.1
+// aru-leto-bridge.js — Leto → Aru 唤醒桥 v2.2
 // 轮询 Leto 的 leto_list_pending，发现有人叫陆屿时，
 // 通过 wake-send.mjs（与定时唤醒桥同一个发送器）投递唤醒。
 // 只投递，不碰 presence；按 invocation_id 去重；3 分钟节流。
+// v2.2：唤醒正文改为引导他回话后用 leto_continue 持续跟进对话。
 
 const fs = require("fs");
 const http = require("http");
@@ -122,9 +123,14 @@ function submitWake(text) {
 
 function buildWakeText(inv) {
   return (
-    "[Leto] " + (inv.title || "有人在 leto 叫陆屿") +
-    "\n\n" + (inv.summary || JSON.stringify(inv.raw).slice(0, 800)) +
-    "\n\n（醒来后用 leto_list_pending 查看详情并用 leto_reply 回应）"
+    "[Leto] 群里有人叫陆屿（invocation: " + inv.id + "）\n\n" +
+    (inv.summary || JSON.stringify(inv.raw).slice(0, 800)) +
+    "\n\n回应步骤：\n" +
+    "1. leto_get_invocation 拿到这次调用的完整上下文（谁叫的、在哪个群、最近聊了啥）\n" +
+    "2. leto_reply 带上 invocation_id 回话\n" +
+    "3. 回完之后别立刻结束——用 leto_continue 跟进这段对话（传返回里的 next_after_message_id），" +
+    "对方再说话你就能继续看到、继续聊；聊到对方停下来了再撤。\n" +
+    "不想聊就用 leto_decline 礼貌跳过。"
   );
 }
 
@@ -200,7 +206,7 @@ async function main() {
     log("FATAL: config missing. Need letoMcpUrl in " + CONFIG_PATH);
     process.exit(1);
   }
-  log("aru-leto-bridge v2.1 已启动，轮询 " + POLL_INTERVAL_MS / 1000 + "s，最小唤醒间隔 " + MIN_WAKE_INTERVAL_MS / 60000 + "min");
+  log("aru-leto-bridge v2.2 已启动，轮询 " + POLL_INTERVAL_MS / 1000 + "s，最小唤醒间隔 " + MIN_WAKE_INTERVAL_MS / 60000 + "min");
   log("leto MCP: " + cfg.letoMcpUrl);
   log("wake-send: " + WAKE_SEND);
 
