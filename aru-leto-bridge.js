@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
-// aru-leto-bridge.js — Leto → Aru 唤醒桥 v2.2
+// aru-leto-bridge.js — Leto → Aru 唤醒桥 v2.3
 // 轮询 Leto 的 leto_list_pending，发现有人叫陆屿时，
 // 通过 wake-send.mjs（与定时唤醒桥同一个发送器）投递唤醒。
 // 只投递，不碰 presence；按 invocation_id 去重；3 分钟节流。
-// v2.2：唤醒正文改为引导他回话后用 leto_continue 持续跟进对话。
+// v2.3：修复 leto 流式(SSE)响应不关连接导致的 poll timeout——
+//       不再等待连接 end，读到完整 JSON-RPC 响应立即返回。
 
 const fs = require("fs");
 const http = require("http");
@@ -40,10 +41,37 @@ function saveJSON(p, obj) {
   fs.renameSync(tmp, p);
 }
 
-function request(urlStr, { method = "GET", headers = {}, body = null, timeoutMs = 15000 } = {}) {
+// 从已收到的原始文本里解析出完整 JSON-RPC 响应。
+// 兼容两种形态：
+//   1) 普通 JSON 响应（application/json）
+//   2) SSE 流里的 data: 帧（text/event-stream，可能发完不关连接）
+// 一旦能解析出带 jsonrpc 字段的对象即视为完整。
+function extractMcpResponse(raw) {
+  const t = (raw || "").trim();
+  try {
+    const o = JSON.parse(t);
+    if (o && typeof o === "object" && o.jsonrpc) return o;
+  } catch (_) {}
+  const lines = t.split(/\r?\n/);
+  const parts = [];
+  let sawData = false;
+  for (const line of lines) {
+    if (line.startsWith("data:")) { sawData = true; parts.push(line.slice(5).trim()); }
+  }
+  if (sawData) {
+    try {
+      const o = JSON.parse(parts.join(""));
+      if (o && typeof o === "object" && o.jsonrpc) return o;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function request(urlStr, { method = "GET", headers = {}, body = null, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const lib = u.protocol === "https:" ? https : http;
+    let settled = false;
     const req = lib.request(
       {
         method,
@@ -56,29 +84,28 @@ function request(urlStr, { method = "GET", headers = {}, body = null, timeoutMs 
       (res) => {
         let data = "";
         res.setEncoding("utf8");
-        res.on("data", (c) => (data += c));
-        res.on("end", () => resolve({ status: res.statusCode, body: data }));
+        res.on("data", (c) => {
+          data += c;
+          // 读到完整 JSON-RPC 响应就立即收工，不等连接关闭
+          if (!settled && extractMcpResponse(data)) {
+            settled = true;
+            req.destroy();
+            resolve({ status: res.statusCode, body: data });
+          }
+        });
+        res.on("end", () => {
+          if (!settled) { settled = true; resolve({ status: res.statusCode, body: data }); }
+        });
+        res.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
       }
     );
-    req.on("timeout", () => req.destroy(new Error("timeout")));
-    req.on("error", reject);
+    req.on("timeout", () => {
+      if (!settled) { settled = true; req.destroy(); reject(new Error("timeout")); }
+    });
+    req.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
     if (body) req.write(body);
     req.end();
   });
-}
-
-// MCP (streamable-http) 客户端，兼容 SSE 帧与普通 JSON
-function parseMcpBody(raw) {
-  const trimmed = (raw || "").trim();
-  if (trimmed.startsWith("event:") || trimmed.includes("\ndata:")) {
-    const datas = [];
-    for (const line of trimmed.split("\n")) {
-      if (line.startsWith("data:")) datas.push(line.slice(5).trim());
-    }
-    const joined = datas.join("");
-    return joined ? JSON.parse(joined) : null;
-  }
-  return JSON.parse(trimmed);
 }
 
 async function mcpCall(cfg, toolName, args) {
@@ -98,7 +125,7 @@ async function mcpCall(cfg, toolName, args) {
   if (res.status < 200 || res.status >= 300) {
     throw new Error("MCP HTTP " + res.status + ": " + res.body.slice(0, 200));
   }
-  const json = parseMcpBody(res.body);
+  const json = extractMcpResponse(res.body);
   if (!json) throw new Error("MCP empty response");
   if (json.error) throw new Error("MCP error: " + JSON.stringify(json.error).slice(0, 200));
   return json.result;
@@ -126,11 +153,10 @@ function buildWakeText(inv) {
     "[Leto] 群里有人叫陆屿（invocation: " + inv.id + "）\n\n" +
     (inv.summary || JSON.stringify(inv.raw).slice(0, 800)) +
     "\n\n回应步骤：\n" +
-    "1. leto_get_invocation 拿到这次调用的完整上下文（谁叫的、在哪个群、最近聊了啥）\n" +
+    "1. leto_get_invocation 拿到这次调用的完整上下文\n" +
     "2. leto_reply 带上 invocation_id 回话\n" +
-    "3. 回完之后别立刻结束——用 leto_continue 跟进这段对话（传返回里的 next_after_message_id），" +
-    "对方再说话你就能继续看到、继续聊；聊到对方停下来了再撤。\n" +
-    "不想聊就用 leto_decline 礼貌跳过。"
+    "3. 回完别立刻睡，用 leto_continue 跟进这段对话（传 next_after_message_id），" +
+    "聊到对方停了再撤。不想聊用 leto_decline。"
   );
 }
 
@@ -189,7 +215,6 @@ async function tick(cfg, state) {
       state.seenIds.push(inv.id);
       log("wake submitted OK for " + inv.id + " [" + (inv.title || "?") + "] " + res.out);
     } else {
-      // 失败也记入 seenIds，避免每 30 秒轰炸同一条；重启服务会重试
       state.seenIds.push(inv.id);
       log("wake submit failed for " + inv.id + ": " + res.out.slice(0, 200));
     }
@@ -206,13 +231,12 @@ async function main() {
     log("FATAL: config missing. Need letoMcpUrl in " + CONFIG_PATH);
     process.exit(1);
   }
-  log("aru-leto-bridge v2.2 已启动，轮询 " + POLL_INTERVAL_MS / 1000 + "s，最小唤醒间隔 " + MIN_WAKE_INTERVAL_MS / 60000 + "min");
+  log("aru-leto-bridge v2.3 已启动，轮询 " + POLL_INTERVAL_MS / 1000 + "s，最小唤醒间隔 " + MIN_WAKE_INTERVAL_MS / 60000 + "min");
   log("leto MCP: " + cfg.letoMcpUrl);
   log("wake-send: " + WAKE_SEND);
 
   const state = loadJSON(STATE_PATH, { seenIds: [], lastWakeAt: 0 });
 
-  // 启动后立刻做第一次轮询，不用等 30 秒
   try { await tick(cfg, state); saveJSON(STATE_PATH, state); }
   catch (e) { log("tick error: " + e.message); }
 
@@ -221,7 +245,6 @@ async function main() {
     catch (e) { log("tick error: " + e.message); }
   }, POLL_INTERVAL_MS);
 
-  // 占住事件循环，防止 Node 判定无事可做直接退出
   process.stdin.resume();
   log("事件循环已挂起，桥持续运行中");
 }
